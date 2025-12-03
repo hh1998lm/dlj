@@ -1,0 +1,489 @@
+'''
+editor:hmy
+date:2025/11/26 9:49
+'''
+
+import os
+import re
+import sys
+import pandas as pd
+from pathlib import Path
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QTextEdit,
+                             QFileDialog, QProgressBar, QMessageBox, QGroupBox,
+                             QSpinBox, QComboBox, QCheckBox, QTabWidget)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QPalette, QColor
+
+
+class RenameWorker(QThread):
+    """重命名工作线程"""
+    progress_signal = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(dict)
+
+    def __init__(self, excel_file, pdf_folder, name_column, start_index, pdf_extension):
+        super().__init__()
+        self.excel_file = excel_file
+        self.pdf_folder = pdf_folder
+        self.name_column = name_column
+        self.start_index = start_index
+        self.pdf_extension = pdf_extension
+        self.is_running = True
+
+    def run(self):
+        try:
+            # 读取Excel文件
+            df = pd.read_excel(self.excel_file)
+            self.log_signal.emit(f"Excel文件加载成功，共 {len(df)} 行数据")
+
+            # 处理列标识
+            if isinstance(self.name_column, str) and self.name_column in df.columns:
+                name_series = df[self.name_column]
+            elif isinstance(self.name_column, int) and 0 <= self.name_column < len(df.columns):
+                name_series = df.iloc[:, self.name_column]
+            else:
+                self.log_signal.emit(f"错误: 列 '{self.name_column}' 不存在")
+                return
+
+            # 获取PDF文件列表
+            pdf_files = sorted([f for f in os.listdir(self.pdf_folder)
+                                if f.lower().endswith(self.pdf_extension.lower())])
+
+            if not pdf_files:
+                self.log_signal.emit(f"在文件夹中未找到 {self.pdf_extension} 文件")
+                return
+
+            self.log_signal.emit(f"找到 {len(pdf_files)} 个PDF文件")
+
+            # 统计信息
+            stats = {'success': 0, 'skip': 0, 'error': 0, 'total': len(pdf_files)}
+
+            for i, pdf_file in enumerate(pdf_files):
+                if not self.is_running:
+                    break
+
+                excel_row_index = i + self.start_index
+                progress = int((i + 1) / len(pdf_files) * 100)
+                self.progress_signal.emit(progress)
+
+                if excel_row_index >= len(df):
+                    self.log_signal.emit(f"警告: Excel数据行不足，跳过剩余PDF文件")
+                    break
+
+                # 获取新文件名
+                new_name = str(name_series.iloc[excel_row_index]).strip()
+
+                # 跳过空值
+                if not new_name or new_name in ['nan', 'None', '']:
+                    self.log_signal.emit(f"跳过空值: {pdf_file} (第{excel_row_index + 1}行)")
+                    stats['skip'] += 1
+                    continue
+
+                # 清理文件名
+                new_name_clean = re.sub(r'[\\/*?:"<>|]', '_', new_name)
+
+                # 构建路径
+                old_path = os.path.join(self.pdf_folder, pdf_file)
+                new_path = os.path.join(self.pdf_folder, f"{new_name_clean}{self.pdf_extension}")
+
+                # 检查文件是否已存在
+                if os.path.exists(new_path) and old_path != new_path:
+                    self.log_signal.emit(f"跳过已存在文件: {new_name_clean}{self.pdf_extension}")
+                    stats['skip'] += 1
+                    continue
+
+                try:
+                    os.rename(old_path, new_path)
+                    self.log_signal.emit(f"✓ {pdf_file} -> {new_name_clean}{self.pdf_extension}")
+                    stats['success'] += 1
+                except Exception as e:
+                    self.log_signal.emit(f"✗ 失败: {pdf_file} -> {e}")
+                    stats['error'] += 1
+
+            self.finished_signal.emit(stats)
+
+        except Exception as e:
+            self.log_signal.emit(f"程序执行出错: {e}")
+
+    def stop(self):
+        self.is_running = False
+
+
+class PDFRenamerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.excel_file = ""
+        self.pdf_folder = ""
+        self.worker = None
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("PDF文件批量重命名工具")
+        self.setGeometry(100, 100, 900, 700)
+
+        # 设置样式
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f0f0;
+            }
+            QGroupBox {
+                font-weight: bold;
+                margin-top: 1em;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QPushButton {
+                padding: 8px 15px;
+                font-weight: bold;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #f6f7fa, stop: 1 #dadbde);
+            }
+            QPushButton:hover {
+                background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #ebebeb, stop: 1 #d5d5d5);
+            }
+            QPushButton:pressed {
+                background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 #d5d5d5, stop: 1 #bababa);
+            }
+            QTextEdit {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QProgressBar {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                width: 20px;
+            }
+        """)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+
+        # 创建标签页
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        # 主操作标签页
+        main_tab = QWidget()
+        tabs.addTab(main_tab, "主操作")
+
+        # 设置标签页
+        settings_tab = QWidget()
+        tabs.addTab(settings_tab, "设置")
+
+        self.setup_main_tab(main_tab)
+        self.setup_settings_tab(settings_tab)
+
+    def setup_main_tab(self, tab):
+        layout = QVBoxLayout(tab)
+
+        # 文件选择区域
+        file_group = QGroupBox("文件选择")
+        file_layout = QVBoxLayout(file_group)
+
+        # Excel文件选择
+        excel_layout = QHBoxLayout()
+        self.excel_label = QLabel("未选择Excel文件")
+        self.excel_label.setStyleSheet("QLabel { padding: 8px; border: 1px solid #ccc; background-color: white; }")
+        excel_btn = QPushButton("选择Excel文件")
+        excel_btn.clicked.connect(self.select_excel_file)
+        excel_layout.addWidget(self.excel_label, 1)
+        excel_layout.addWidget(excel_btn)
+        file_layout.addLayout(excel_layout)
+
+        # PDF文件夹选择
+        pdf_layout = QHBoxLayout()
+        self.pdf_label = QLabel("未选择PDF文件夹")
+        self.pdf_label.setStyleSheet("QLabel { padding: 8px; border: 1px solid #ccc; background-color: white; }")
+        pdf_btn = QPushButton("选择PDF文件夹")
+        pdf_btn.clicked.connect(self.select_pdf_folder)
+        pdf_layout.addWidget(self.pdf_label, 1)
+        pdf_layout.addWidget(pdf_btn)
+        file_layout.addLayout(pdf_layout)
+
+        layout.addWidget(file_group)
+
+        # 预览区域
+        preview_group = QGroupBox("文件预览")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.preview_text = QTextEdit()
+        self.preview_text.setMaximumHeight(150)
+        self.preview_text.setReadOnly(True)
+        preview_layout.addWidget(self.preview_text)
+
+        preview_btn = QPushButton("预览重命名效果")
+        preview_btn.clicked.connect(self.preview_rename)
+        preview_layout.addWidget(preview_btn)
+
+        layout.addWidget(preview_group)
+
+        # 进度区域
+        progress_group = QGroupBox("重命名进度")
+        progress_layout = QVBoxLayout(progress_group)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        progress_layout.addWidget(self.progress_bar)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        progress_layout.addWidget(self.log_text)
+
+        layout.addWidget(progress_group)
+
+        # 按钮区域
+        button_layout = QHBoxLayout()
+
+        self.start_btn = QPushButton("开始重命名")
+        self.start_btn.clicked.connect(self.start_rename)
+        self.start_btn.setEnabled(False)
+
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.clicked.connect(self.stop_rename)
+        self.stop_btn.setEnabled(False)
+
+        clear_btn = QPushButton("清空日志")
+        clear_btn.clicked.connect(self.clear_log)
+
+        button_layout.addWidget(self.start_btn)
+        button_layout.addWidget(self.stop_btn)
+        button_layout.addWidget(clear_btn)
+        button_layout.addStretch()
+
+        layout.addLayout(button_layout)
+
+    def setup_settings_tab(self, tab):
+        layout = QVBoxLayout(tab)
+
+        # 列设置
+        column_group = QGroupBox("列设置")
+        column_layout = QVBoxLayout(column_group)
+
+        column_help = QLabel("请先选择Excel文件，然后在此选择包含文件名的列")
+        column_help.setWordWrap(True)
+        column_layout.addWidget(column_help)
+
+        column_select_layout = QHBoxLayout()
+        column_select_layout.addWidget(QLabel("选择列:"))
+        self.column_combo = QComboBox()
+        self.column_combo.currentTextChanged.connect(self.on_column_changed)
+        column_select_layout.addWidget(self.column_combo, 1)
+        column_layout.addLayout(column_select_layout)
+
+        layout.addWidget(column_group)
+
+        # 其他设置
+        other_group = QGroupBox("其他设置")
+        other_layout = QVBoxLayout(other_group)
+
+        start_index_layout = QHBoxLayout()
+        start_index_layout.addWidget(QLabel("起始行索引:"))
+        self.start_index_spin = QSpinBox()
+        self.start_index_spin.setRange(0, 1000)
+        self.start_index_spin.setValue(0)
+        self.start_index_spin.setToolTip("从Excel的第几行开始读取（0表示第一行）")
+        start_index_layout.addWidget(self.start_index_spin)
+        start_index_layout.addStretch()
+        other_layout.addLayout(start_index_layout)
+
+        extension_layout = QHBoxLayout()
+        extension_layout.addWidget(QLabel("文件扩展名:"))
+        self.extension_combo = QComboBox()
+        self.extension_combo.addItems(['.pdf', '.PDF', '.doc', '.docx'])
+        self.extension_combo.setEditable(True)
+        extension_layout.addWidget(self.extension_combo)
+        extension_layout.addStretch()
+        other_layout.addLayout(extension_layout)
+
+        layout.addWidget(other_group)
+        layout.addStretch()
+
+    def select_excel_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择Excel文件", "", "Excel文件 (*.xlsx *.xls)")
+        if file_path:
+            self.excel_file = file_path
+            self.excel_label.setText(file_path)
+            self.load_excel_columns()
+            self.check_ready()
+
+    def select_pdf_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "选择PDF文件夹")
+        if folder_path:
+            self.pdf_folder = folder_path
+            self.pdf_label.setText(folder_path)
+            self.update_preview()
+            self.check_ready()
+
+    def load_excel_columns(self):
+        """加载Excel文件的列名"""
+        try:
+            df = pd.read_excel(self.excel_file)
+            self.column_combo.clear()
+            self.column_combo.addItems(df.columns.tolist())
+            if len(df.columns) > 0:
+                self.column_combo.setCurrentIndex(0)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法读取Excel文件: {e}")
+
+    def on_column_changed(self, column_name):
+        """列选择改变时更新预览"""
+        if self.excel_file and self.pdf_folder:
+            self.update_preview()
+
+    def update_preview(self):
+        """更新文件预览"""
+        if not self.pdf_folder:
+            return
+
+        try:
+            pdf_files = sorted([f for f in os.listdir(self.pdf_folder)
+                                if f.lower().endswith(self.extension_combo.currentText().lower())])
+            preview_text = f"找到 {len(pdf_files)} 个文件:\n"
+            for i, file in enumerate(pdf_files[:10]):  # 只显示前10个
+                preview_text += f"{i + 1}. {file}\n"
+            if len(pdf_files) > 10:
+                preview_text += f"... 还有 {len(pdf_files) - 10} 个文件\n"
+
+            self.preview_text.setText(preview_text)
+        except Exception as e:
+            self.preview_text.setText(f"预览错误: {e}")
+
+    def preview_rename(self):
+        """预览重命名效果"""
+        if not all([self.excel_file, self.pdf_folder]):
+            QMessageBox.warning(self, "警告", "请先选择Excel文件和PDF文件夹")
+            return
+
+        try:
+            df = pd.read_excel(self.excel_file)
+            pdf_files = sorted([f for f in os.listdir(self.pdf_folder)
+                                if f.lower().endswith(self.extension_combo.currentText().lower())])
+
+            preview_text = "重命名预览:\n" + "=" * 50 + "\n"
+
+            column_name = self.column_combo.currentText()
+            start_index = self.start_index_spin.value()
+
+            for i, pdf_file in enumerate(pdf_files[:15]):  # 只预览前15个
+                excel_row_index = i + start_index
+                if excel_row_index < len(df):
+                    new_name = str(df.iloc[excel_row_index][column_name]).strip()
+                    new_name_clean = re.sub(r'[\\/*?:"<>|]', '_', new_name)
+
+                    if new_name and new_name not in ['nan', 'None', '']:
+                        preview_text += f"{pdf_file}\n    → {new_name_clean}{self.extension_combo.currentText()}\n\n"
+                    else:
+                        preview_text += f"{pdf_file}\n    → [跳过 - 空值]\n\n"
+                else:
+                    preview_text += f"{pdf_file}\n    → [跳过 - Excel数据不足]\n\n"
+
+            if len(pdf_files) > 15:
+                preview_text += f"... 还有 {len(pdf_files) - 15} 个文件\n"
+
+            self.log_text.setText(preview_text)
+
+        except Exception as e:
+            QMessageBox.warning(self, "预览错误", f"预览时发生错误: {e}")
+
+    def check_ready(self):
+        """检查是否准备好开始重命名"""
+        if self.excel_file and self.pdf_folder:
+            self.start_btn.setEnabled(True)
+        else:
+            self.start_btn.setEnabled(False)
+
+    def start_rename(self):
+        """开始重命名"""
+        if not all([self.excel_file, self.pdf_folder]):
+            return
+
+        # 禁用开始按钮，启用停止按钮
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        # 清空日志
+        self.log_text.clear()
+        self.log_text.append("开始重命名过程...\n")
+
+        # 创建工作线程
+        self.worker = RenameWorker(
+            excel_file=self.excel_file,
+            pdf_folder=self.pdf_folder,
+            name_column=self.column_combo.currentText(),
+            start_index=self.start_index_spin.value(),
+            pdf_extension=self.extension_combo.currentText()
+        )
+
+        # 连接信号
+        self.worker.progress_signal.connect(self.progress_bar.setValue)
+        self.worker.log_signal.connect(self.log_text.append)
+        self.worker.finished_signal.connect(self.rename_finished)
+
+        # 启动线程
+        self.worker.start()
+
+    def stop_rename(self):
+        """停止重命名"""
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+            self.log_text.append("\n用户停止重命名过程")
+
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def rename_finished(self, stats):
+        """重命名完成"""
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+        # 显示统计信息
+        result_text = f"\n重命名完成!\n"
+        result_text += f"成功: {stats['success']}\n"
+        result_text += f"跳过: {stats['skip']}\n"
+        result_text += f"失败: {stats['error']}\n"
+        result_text += f"总计: {stats['total']}"
+
+        self.log_text.append(result_text)
+
+        # 显示完成消息
+        QMessageBox.information(self, "完成", "重命名过程已完成!")
+
+    def clear_log(self):
+        """清空日志"""
+        self.log_text.clear()
+
+
+def main():
+    app = QApplication(sys.argv)
+
+    # 设置应用程序属性
+    app.setApplicationName("PDF重命名工具")
+    app.setApplicationVersion("1.0")
+
+    window = PDFRenamerGUI()
+    window.show()
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
